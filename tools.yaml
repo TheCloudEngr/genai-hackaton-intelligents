@@ -1,0 +1,536 @@
+sources:
+  my-cloud-sql-source:
+    kind: cloud-sql-postgres
+    project: smart-hospital-hackaton
+    region: us-central1
+    instance: hospital-db-instance
+    database: postgres
+    user: postgres
+    password: "postgres"
+
+tools:
+
+  # 🔍 Find doctor by name
+  search-doctors-by-name:
+    kind: postgres-sql
+    source: my-cloud-sql-source
+    description: "Search for a doctor's database ID and specialty using their name."
+    parameters:
+      - name: name
+        type: string
+        description: "The name or partial name of the doctor (e.g., 'Misolas')."
+    statement: |
+      SELECT id, name, specialty 
+      FROM doctors_info
+      WHERE name ILIKE '%' || $1 || '%' 
+      AND is_active = true;
+
+  # 🧠 Find doctor by specialty
+  search-doctors-by-specialty:
+    kind: postgres-sql
+    source: my-cloud-sql-source
+    description: "Advanced search that maps common terms to medical specialties."
+    parameters:
+      - name: query
+        type: string
+        description: "Query parameters"
+    statement: |
+      SELECT id, name, specialty 
+      FROM doctors_info
+      WHERE is_active = true 
+      AND (
+        specialty ILIKE '%' || $1 || '%' 
+        OR (LOWER($1) = 'skin' AND specialty ILIKE 'Dermatol%')
+        OR (LOWER($1) = 'heart' AND specialty ILIKE 'Cardio%')
+        OR (LOWER($1) = 'kidney' AND specialty ILIKE 'Urol%')
+        OR (LOWER($1) = 'stomach' AND specialty ILIKE 'Gastro%')
+      )
+
+  # 📅 Get doctor schedule by doctor_id
+  get-doctor-schedule:
+    kind: postgres-sql
+    source: my-cloud-sql-source
+    description: Get weekly schedule of a doctor using doctor_id.
+    parameters:
+      - name: doctor_id
+        type: integer
+        description: The ID of the doctor.
+    statement: |
+      SELECT *
+      FROM doctor_schedule
+      WHERE doctor_id = $1
+      ORDER BY day_of_week, start_time;
+  
+  admin-search-doctors:
+    kind: postgres-sql
+    source: my-cloud-sql-source
+    description: "ADMIN ONLY: Search for any doctor (active or inactive) by name."
+    parameters:
+      - name: name
+        type: string
+        description: "Name of the doctor to find."
+    statement: |
+      SELECT id, name, specialty, is_active 
+      FROM doctors_info
+      WHERE name ILIKE '%' || $1 || '%';
+
+  # 📆 Find doctors available on a specific day
+  find-doctors-by-day:
+    kind: postgres-sql
+    source: my-cloud-sql-source
+    description: Find doctors available on a specific day of week (0=Sunday to 6=Saturday).
+    parameters:
+      - name: day_of_week
+        type: integer
+        description: Day of week (0=Sunday, 1=Monday, ..., 6=Saturday).
+    statement: |
+      SELECT d.id, d.name, d.specialty, d.email, s.day_of_week, s.start_time, s.end_time
+      FROM doctors_info d
+      JOIN doctor_schedule s ON d.id = s.doctor_id
+      WHERE s.day_of_week = $1
+      ORDER BY s.start_time;
+
+  # ⏰ Find doctors available by day + time
+  find-doctors-by-day-and-time:
+    kind: postgres-sql
+    source: my-cloud-sql-source
+    description: Find doctors available on a specific day and time.
+    parameters:
+      - name: day_of_week
+        type: integer
+        description: Day of week (0=Sunday, 1=Monday, ..., 6=Saturday)
+      - name: time
+        type: string
+        description: Time in HH:MM format (24-hour).
+    statement: |
+      SELECT d.id, d.name, d.specialty, s.start_time, s.end_time
+      FROM doctors_info d
+      JOIN doctor_schedule s ON d.id = s.doctor_id
+      WHERE s.day_of_week = $1
+      AND $2::time BETWEEN s.start_time AND s.end_time;
+
+  # 🚫 Check doctor unavailability (leave, vacation)
+  check-doctor-unavailability:
+    kind: postgres-sql
+    source: my-cloud-sql-source
+    description: Check if a doctor is unavailable on a specific date.
+    parameters:
+      - name: doctor_id
+        type: integer
+        description: The ID of the doctor.
+      - name: date
+        type: string
+        description: Date in YYYY-MM-DD format
+    statement: |
+      SELECT *
+      FROM doctor_unavailability
+      WHERE doctor_id = $1
+      AND unavailable_date = $2::date;
+
+  # ⚠️ Check appointment conflicts
+  check-appointment-conflict:
+    kind: postgres-sql
+    source: my-cloud-sql-source
+    description: Check if a doctor already has an appointment at a given time.
+    parameters:
+      - name: doctor_id
+        type: integer
+        description: The ID of the doctor.
+      - name: appointment_datetime
+        type: string
+        description: Date and time in YYYY-MM-DD HH:MM format
+    statement: |
+      SELECT id, patient_id, appointment_datetime, status
+      FROM appointments
+      WHERE doctor_id = $1::integer
+        AND status != 'canceled'
+        AND appointment_datetime::date = $2::date 
+      ORDER BY appointment_datetime;
+
+  # 📝 Book an appointment
+  book-appointment:
+    kind: postgres-sql
+    source: my-cloud-sql-source
+    description: "A composite tool that handles the end-to-end booking flow. It first ensures a patient record exists in the 'patients' table (upserting by email) and then creates the appointment entry in the 'appointments' table."
+    parameters:
+      - name: patient_name
+        type: string
+        description: "The full name of the patient."
+      - name: patient_email
+        type: string
+        description: "The unique email address of the patient. Used as the unique identifier for patient records."
+      - name: patient_phone
+        type: string
+        description: "The contact phone number of the patient."
+      - name: doctor_id
+        type: integer
+        description: "The unique database ID of the doctor being booked."
+      - name: appointment_datetime
+        type: string
+        description: "The preferred date and time for the appointment in YYYY-MM-DD HH:MM format."
+      - name: reason
+        type: string
+        description: "A brief description of the patient's symptoms or the reason for the medical visit."
+    statement: |
+      WITH p AS (
+        INSERT INTO patients (name, email, phone)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (email) DO UPDATE 
+          SET name = EXCLUDED.name, 
+              phone = EXCLUDED.phone
+        RETURNING id
+      )
+      INSERT INTO appointments (
+        patient_id,
+        doctor_id,
+        appointment_datetime,
+        reason,
+        status,
+        created_at
+      )
+      SELECT 
+        id, 
+        $4, 
+        $5::timestamp, 
+        $6, 
+        'scheduled', 
+        CURRENT_TIMESTAMP 
+      FROM p
+      RETURNING *;
+
+  # Add doctor leave/vacation date
+  add-doctor-unavailability:
+    kind: postgres-sql
+    source: my-cloud-sql-source
+    description: Add a leave/vacation for a doctor on a specific date.
+    parameters:
+      - name: doctor_id
+        type: integer
+        description: ID of the doctor
+      - name: unavailable_date
+        type: string
+        description: Date of unavailability in YYYY-MM-DD format
+      - name: reason
+        type: string
+        description: Reason for unavailability (leave, vacation, etc.)
+    statement: |
+      INSERT INTO doctor_unavailability (doctor_id, unavailable_date, reason)
+      VALUES ($1, $2::date, $3)
+      RETURNING *;
+
+  # Add patient details in the patients table
+  add-patient:
+    kind: postgres-sql
+    source: my-cloud-sql-source
+    description: Add a new patient to the system.
+    parameters:
+      - name: name
+        type: string
+        description: Full name of the patient
+      - name: email
+        type: string
+        description: Patient email
+      - name: phone
+        type: string
+        description: Patient phone number
+    statement: |
+      INSERT INTO patients (name, email, phone)
+      VALUES ($1, $2, $3)
+      RETURNING *;
+
+  # DELETE patient details
+  delete-patient:
+    kind: postgres-sql
+    source: my-cloud-sql-source
+    description: "Permanently delete a patient record from the system using their ID. Note: This will only work if the patient has no associated appointments (due to foreign key constraints)."
+    parameters:
+      - name: patient_id
+        type: integer
+        description: The unique ID of the patient to delete.
+    statement: |
+      DELETE FROM patients
+      WHERE id = $1
+      RETURNING id, name, email;
+
+  # Add new doctors detail in doctors_info table
+  add-new-doctor:
+    kind: postgres-sql
+    source: my-cloud-sql-source
+    description: Add a new doctor to the system.
+    parameters:
+      - name: name
+        type: string
+        description: Full name of the doctor
+      - name: specialty
+        type: string
+        description: Medical specialty of the doctor
+      - name: email
+        type: string
+        description: Doctor's email
+    statement: |
+      INSERT INTO doctors_info (name, specialty, email)
+      VALUES ($1, $2, $3)
+      RETURNING *;
+  
+  # Add doctor schedule
+  add-doctor-schedule:
+    kind: postgres-sql
+    source: my-cloud-sql-source
+    description: Add a weekly schedule entry for a doctor.
+    parameters:
+      - name: doctor_id
+        type: integer
+        description: ID of the doctor
+      - name: day_of_week
+        type: integer
+        description: Day of week (0=Sunday to 6=Saturday)
+      - name: start_time
+        type: string
+        description: Start time in HH:MM format
+      - name: end_time
+        type: string
+        description: End time in HH:MM format
+    statement: |
+      INSERT INTO doctor_schedule (doctor_id, day_of_week, start_time, end_time)
+      VALUES ($1, $2, $3::time, $4::time)
+      RETURNING *;
+  
+  # Update doctor schedule
+  update-doctor-schedule:
+    kind: postgres-sql
+    source: my-cloud-sql-source
+    description: Update an existing schedule entry for a doctor.
+    parameters:
+      - name: schedule_id
+        type: integer
+        description: ID of the schedule entry to update
+      - name: day_of_week
+        type: integer
+        description: Day of week (0=Sunday to 6=Saturday)
+      - name: start_time
+        type: string
+        description: Start time in HH:MM format
+      - name: end_time
+        type: string
+        description: End time in HH:MM format
+    statement: |
+      UPDATE doctor_schedule
+      SET day_of_week = $2,
+          start_time = $3::time,
+          end_time = $4::time
+      WHERE id = $1
+      RETURNING *;
+
+  # Delete doctor schedule
+  delete-doctor-schedule:
+    kind: postgres-sql
+    source: my-cloud-sql-source
+    description: Delete a schedule entry for a doctor.
+    parameters:
+      - name: schedule_id
+        type: integer
+        description: ID of the schedule entry to delete
+    statement: |
+      DELETE FROM doctor_schedule
+      WHERE id = $1
+      RETURNING *;
+
+  # Deactivate doctor when no longer working in the hospital
+  deactivate-doctor:
+    kind: postgres-sql
+    source: my-cloud-sql-source
+    description: Deactivate a doctor when they leave the hospital (soft delete).
+    parameters:
+      - name: doctor_id
+        type: integer
+        description: ID of the doctor to deactivate
+    statement: |
+      UPDATE doctors_info
+      SET is_active = FALSE
+      WHERE id = $1
+      RETURNING *;
+
+  # Update doctor info
+  update-doctor-info:
+    kind: postgres-sql
+    source: my-cloud-sql-source
+    description: Update a doctor’s name, specialty, or email.
+    parameters:
+      - name: doctor_id
+        type: integer
+        description: ID of the doctor
+      - name: name
+        type: string
+        description: Full name of the doctor
+      - name: specialty
+        type: string
+        description: Medical specialty
+      - name: email
+        type: string
+        description: Doctor’s email
+    statement: |
+      UPDATE doctors_info
+      SET name = $2,
+          specialty = $3,
+          email = $4
+      WHERE id = $1
+      RETURNING *;
+
+  # Reactivate doctor - rehire doctors
+  reactivate-doctor:
+    kind: postgres-sql
+    source: my-cloud-sql-source
+    description: Reactivate a previously deactivated doctor.
+    parameters:
+      - name: doctor_id
+        type: integer
+        description: ID of the doctor
+    statement: |
+      UPDATE doctors_info
+      SET is_active = TRUE
+      WHERE id = $1
+      RETURNING *;
+  
+  # Update patient information for any changes
+  update-patient-info:
+    kind: postgres-sql
+    source: my-cloud-sql-source
+    description: Update patient information.
+    parameters:
+      - name: patient_id
+        type: integer
+        description: ID of the patient
+      - name: name
+        type: string
+        description: Full name of the patient
+      - name: email
+        type: string
+        description: Email address of the patient
+      - name: phone
+        type: string
+        description: Phone number of the patient
+    statement: |
+      UPDATE patients
+      SET name = $2,
+          email = $3,
+          phone = $4
+      WHERE id = $1
+      RETURNING *;
+  
+  # Cancel appointment
+  cancel-appointment:
+    kind: postgres-sql
+    source: my-cloud-sql-source
+    description: Cancel an appointment.
+    parameters:
+      - name: appointment_id
+        type: integer
+        description: ID of the appointment to cancel
+    statement: |
+      UPDATE appointments
+      SET status = 'canceled'
+      WHERE id = $1
+      RETURNING id, patient_id, doctor_id, appointment_datetime, reason, status, created_at;
+
+  # Reschedule appointment
+  reschedule-appointment:
+    kind: postgres-sql
+    source: my-cloud-sql-source
+    description: Reschedule an existing appointment.
+    parameters:
+      - name: appointment_id
+        type: integer
+        description: ID of the appointment to reschedule
+      - name: new_datetime
+        type: string
+        description: New date and time in ISO format YYYY-MM-DD HH:MM
+    statement: |
+      UPDATE appointments
+      SET appointment_datetime = $2
+      WHERE id = $1
+      RETURNING id, patient_id, doctor_id, appointment_datetime, reason, status, created_at;
+
+  # Search appointments
+  search-appointments:
+    kind: postgres-sql
+    source: my-cloud-sql-source
+    description: Search appointments by doctor, patient, date range, or status. Includes patient and doctor names.
+    parameters:
+      - name: doctor_id
+        type: integer
+        description: ID of the doctor (optional)
+      - name: patient_id
+        type: integer
+        description: ID of the patient (optional)
+      - name: start_date
+        type: string
+        description: Start of date range YYYY-MM-DD (optional)
+      - name: end_date
+        type: string
+        description: End of date range YYYY-MM-DD (optional)
+      - name: status
+        type: string
+        description: Appointment status - booked, scheduled or canceled (optional)
+    statement: |
+      SELECT 
+        a.id, 
+        a.patient_id, 
+        p.name AS patient_name, 
+        a.doctor_id, 
+        d.name AS doctor_name, 
+        a.appointment_datetime, 
+        a.reason, 
+        a.status, 
+        a.created_at
+      FROM appointments a
+      LEFT JOIN doctors_info d ON a.doctor_id = d.id
+      LEFT JOIN patients p ON a.patient_id = p.id 
+      WHERE (($1::integer IS NULL OR $1::integer = 0) OR a.doctor_id = $1::integer)
+        AND (($2::integer IS NULL OR $2::integer = 0) OR a.patient_id = $2::integer)
+        AND ($3::date IS NULL OR a.appointment_datetime::date >= $3::date)
+        AND ($4::date IS NULL OR a.appointment_datetime::date <= $4::date)
+        AND (($5::text IS NULL OR $5::text = '') OR a.status = $5::text)
+      ORDER BY a.appointment_datetime;
+
+      
+  # Search patients by name
+  search-patients-by-name:
+    kind: postgres-sql
+    source: my-cloud-sql-source
+    description: Find a patient's ID and current details using their name.
+    parameters:
+      - name: name
+        type: string
+        description: Full or partial name of the patient.
+    statement: |
+      SELECT id, name, email, phone 
+      FROM patients 
+      WHERE name ILIKE '%' || $1 || '%'
+      ORDER BY name;
+
+toolsets:
+  hospital_toolset:
+    - search-doctors-by-name
+    - search-doctors-by-specialty
+    - get-doctor-schedule
+    - find-doctors-by-day
+    - find-doctors-by-day-and-time
+    - check-doctor-unavailability
+    - check-appointment-conflict
+    - book-appointment
+    - add-doctor-unavailability
+    - add-patient
+    - delete-patient
+    - add-new-doctor
+    - add-doctor-schedule
+    - update-doctor-schedule
+    - delete-doctor-schedule
+    - deactivate-doctor
+    - update-doctor-info
+    - reactivate-doctor
+    - update-patient-info
+    - cancel-appointment
+    - reschedule-appointment
+    - search-appointments
+    - admin-search-doctors
+    - search-patients-by-name
