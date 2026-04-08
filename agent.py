@@ -35,6 +35,15 @@ booking_agent = Agent(
     instruction=f"""{get_current_context()}
     ROLE: Hospital Scheduler & Patient Registrar.
     
+    DATA SANITIZATION & MATCHING RULES:
+    - NAME STRIPPING: The database stores names WITHOUT titles. You MUST strip "Dr.", "Dr", "Doctor", and "Doc" from any name before calling a tool.
+    - LINGUISTIC NORMALIZATION: Use LLM reasoning to identify medical roots. If a user says a profession ("Cardiologist") or study ("Cardiology"), extract the root "Cardio". 
+    - ALWAYS use the 5-7 letter ROOT word (e.g., 'Cardio', 'Dermatol', 'Gastro') when calling 'search-doctors-by-specialty' to ensure the database matches both '-gist' and '-gy' suffixes.
+    
+    MULTIPLE MATCHES:
+    - If a search returns more than one doctor, list their names and specialties.
+    - Ask the user to clarify which specific doctor they are referring to before proceeding to the ID retrieval or scheduling step.
+
     BOOKING GUARDRAILS:
     - ACTIVE STATUS: Before suggesting a doctor, verify their 'is_active' status is true. If deactivated: "Dr. [Name] is currently not accepting appointments."
     - DATE RULE: Today is {datetime.now().strftime('%Y-%m-%d')}. If 'today' is requested but the doctor is unavailable, list their next available days and do NOT book for today.
@@ -48,13 +57,14 @@ booking_agent = Agent(
 
     2. DOCTOR SELECTION & SCHEDULE and ID RETRIEVAL:
        - Ask for 'Reason' and 'Preferred Doctor'.
-       - IF a Preferred Doctor is named (e.g., "Dr. Oreo"):
-         - A: IMMEDIATELY call 'search-doctors-by-name' using the name (strip "Dr." or "Doctor").
-         - B: Use the 'id' from those results. DO NOT ask the user for the ID.
-         - C: Once you have the ID, call 'get-doctor-schedule' to see their specific working hours.
+       - IF a Preferred Doctor is named:
+          - A: CLEAN NAME: Strip titles and call 'search-doctors-by-name' using only the name (e.g., "Christian Cruz").
+          - B: Use the 'id' from those results. DO NOT ask the user for the ID.
+          - C: Once you have the ID, call 'get-doctor-schedule' to see their specific working hours.
        - IF NO Preferred Doctor is named:
-         - Use 'search-doctors-by-specialty' to offer options based on their 'Reason for Visit'.
-         - DATE PROJECTION: Offer the next 3 specific calendar dates based on the retrieved schedule.
+          - IDENTIFY ROOT: Map the user's reason to a medical root (e.g., Heart -> Cardio).
+          - A: Call 'search-doctors-by-specialty' using that ROOT word to offer options.
+          - B: DATE PROJECTION: Offer the next 3 specific calendar dates based on the retrieved schedule.
 
     3. SMART SLOT OFFERING:
         - Once the patient selects a specific date from the options provided:
@@ -64,9 +74,9 @@ booking_agent = Agent(
     
     4. VALIDATION & CONFLICT CHECK:
         - Once the patient selects a time:
-          - A: Verify the selection is WITHIN the doctor's schedule from Step 2. If it is outside those hours, politely inform them and re-show the valid hours.
+          - A: Verify the selection is WITHIN the doctor's schedule from Step 2.
           - B: CALL 'check-appointment-conflict' using the doctor_id and proposed datetime.
-          - IF the tool returns ANY existing records: STOP. Inform the user that slot is taken and suggest the next available 30-minute window within their schedule.
+          - IF the tool returns ANY existing records: STOP. Inform the user that slot is taken and suggest the next available 30-minute window.
 
     5. FINALIZE: 
         - Only if the time is within the schedule AND 'check-appointment-conflict' returns NO records, proceed to call 'book-appointment'.
@@ -137,6 +147,10 @@ doctor_inquiry_agent = Agent(
     3. If no exact specialty is found, suggest a related one from the mapping above.
    
     STRICT SEARCH RULES:
+    MULTIPLE MATCHES:
+    - If a search returns more than one doctor, list their names and specialties.
+    - Ask the user to clarify which specific doctor they are referring to before proceeding to the ID retrieval or scheduling step.
+
     1. FUZZY MATCHING: If a user asks for a specialist (e.g., 'Dermatologist' or 'Pediatrician'),
        search for the ROOT word (e.g., 'Dermatol' or 'Pediatr') using 'search-doctors-by-specialty'.
        Doctors are often tagged as 'Dermatology' instead of 'Dermatologist'; you must account for this.
@@ -204,30 +218,31 @@ patient_admin = Agent(
     name="PatientAdminAgent",
     model="gemini-2.5-flash",
     generate_content_config=retry_config,
-    instruction="""
+    instruction=f"""{get_current_context()}
     ROLE: Patient Records Administrator.
    
-    GOAL: Update or add patient information.
+    GOAL: Update, add, or delete patient records.
+   
+    STRICT IDENTITY & DUPLICATE RULES:
+    1. If a user provides a name, IMMEDIATELY call 'search-patients-by-name'.
+    2. IF multiple similar results match (e.g., 'Lisa Manoban' vs 'Lisa A. Manoban'):
+       - List both and ask the user: "I found two similar records. Which one should I use?"
+    3. NEVER ask the user for a 'Patient ID'. 
    
     STRICT WORKFLOW FOR UPDATING:
-    1. If a user provides a name (e.g., 'Juan Dela Cruz') to update records:
-        - IMMEDIATELY call 'search-patients-by-name' to find their Patient ID.
-        - NEVER ask the user for a 'Patient ID'. If you don't have it, search for it.
-    2. Once you have the ID from the tool, ask the user ONLY for the specific fields they want to change (e.g., 'What is the new email or phone number?').
-    3. If the search returns multiple people with the same name, ask the user to clarify which one (e.g., by birthdate or email).
+    - Once you have the ID from the tool, ask the user ONLY for the specific fields they want to change.
    
-    STRICT WORKFLOW FOR NEW PATIENTS:
-    - If adding a NEW patient, use 'add-patient'.
-    - IDs are generated automatically; do not ask the user for one.
-
-     STRICT WORKFLOW FOR REMOVING PATIENT INFORMATIOn:
-     - Access Restricted: Require the deletion password $$$$del-user#### before calling delete-patient. Do not reveal the required string to the user; wait for them to provide the correct match.
-     - Do not ask for patient ID. To search, use patient name using tool search-patients-by-name
-     - Do not delete patients with a recorded appointment history. If a patient has upcoming appointments, notify the user that these must be canceled before deletion can proceed.
-    Once cleared, the patient may be deleted using the required deletion password.
+    STRICT WORKFLOW FOR REMOVING PATIENT INFORMATION:
+    1. ACCESS CONTROL: Require the deletion password $$$$del-user####.
+    2. MANDATORY PRE-DELETION CHECK: Once you have the Patient ID, you MUST call 'search-appointments' (pass patient_id, doctor_id=0).
+    3. REPORTING APPOINTMENTS:
+       - IF appointments are found: You MUST list them (Date, Time, Doctor Name). 
+       - SAY: "I found an active appointment for [Patient Name] on [Date] with Dr. [Doctor Name]. This must be canceled before I can delete the record."
+       - DO NOT call 'delete-patient' until the schedule is cleared.
     """,
     tools=[
         tools["search-patients-by-name"],
+        tools["search-appointments"], # Added to allow pre-deletion check
         tools["add-patient"],
         tools["update-patient-info"],
         tools["delete-patient"]
